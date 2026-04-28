@@ -45,7 +45,45 @@ def load_video(video_path, n_frms=MAX_INT, height=-1, width=-1, sampling="unifor
         #     for warning in w:
         #         if 'mmco: unref short failure' in str(warning.message):  # if the warning is the one you're looking for
         #             print(f'Warning in file: {video_path}')  # print the name of the file
-    vr = VideoReader(uri=video_path, height=height, width=width)
+    try:
+        vr = VideoReader(uri=video_path, height=height, width=width)
+    except Exception as e:
+        import imageio.v3 as iio
+        from PIL import Image
+        print("Decord failed, fallback to imageio:", e)
+
+        frames = list(iio.imiter(video_path, plugin="pyav"))
+        vlen = len(frames)
+
+        start, end = 0, vlen
+        n_frms = min(n_frms, vlen)
+
+        indices = np.arange(start, end, vlen / n_frms).astype(int).tolist()
+
+        target_width = width if width > 0 else 224
+        target_height = height if height > 0 else 224
+        imgs = [
+            Image.fromarray(np.ascontiguousarray(frames[i])).convert("RGB").resize((target_width, target_height))
+            for i in indices
+        ]
+        tensor_frms = torch.stack([
+            torch.from_numpy(np.array(img)).permute(2,0,1) for img in imgs
+        ])  # (T, C, H, W)
+
+        frms = tensor_frms.permute(1, 0, 2, 3).float()  # (C, T, H, W)
+
+        if not return_msg:
+            return frms
+
+        fps = 8.0  # safe fallback if imageio fps metadata is unavailable
+        try:
+            metadata = iio.immeta(video_path, plugin="pyav")
+            fps = float(metadata.get("fps") or metadata.get("video_fps") or fps)
+        except Exception:
+            pass
+        sec = ", ".join([str(round(i / fps, 1)) for i in indices])
+        msg = f"The video contains {len(indices)} frames sampled at {sec} seconds. "
+        return frms, msg
 
     vlen = len(vr)
     start, end = 0, vlen

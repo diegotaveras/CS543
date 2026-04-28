@@ -30,7 +30,7 @@ from vtgllm.models.vit import build_vit
 class Blip2Base(BaseModel):
     @classmethod
     def init_tokenizer(cls):
-        tokenizer = BertTokenizer.from_pretrained("model/bert-base-uncased")
+        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         tokenizer.add_special_tokens({"bos_token": "[DEC]"})
         return tokenizer
 
@@ -46,7 +46,7 @@ class Blip2Base(BaseModel):
 
     @classmethod
     def init_Qformer(cls, num_query_token, vision_width, cross_attention_freq=2):
-        encoder_config = BertConfig.from_pretrained("model/bert-base-uncased")
+        encoder_config = BertConfig.from_pretrained("bert-base-uncased")
         encoder_config.encoder_width = vision_width
         # insert cross-attention layer every other block
         encoder_config.add_cross_attention = True
@@ -113,6 +113,7 @@ class Blip2Base(BaseModel):
         return vision_encoder, vision_layernorm
 
     def load_from_pretrained(self, url_or_filename):
+        # url_or_filename = "/Users/taver/Desktop/CS543/VTG-LLM/VTG-LLM/model/instruct_blip_vicuna7b_trimmed.pth"
         if is_url(url_or_filename):
             cached_file = download_cached_file(
                 url_or_filename, check_hash=False, progress=True

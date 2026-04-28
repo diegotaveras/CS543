@@ -300,7 +300,7 @@ class VTGLLM(Blip2Base):
         if self.low_resource:
             self.llama_model = LlamaForCausalLM.from_pretrained(
                 llama_model,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.float32,
                 load_in_8bit=True,
                 device_map={'': device_8bit}
             )
@@ -309,7 +309,7 @@ class VTGLLM(Blip2Base):
                 logging.info(f"interpolate llama model's rope from 2048 to {max_txt_len}")
                 self.llama_model = LlamaForCausalLM.from_pretrained(
                     llama_model,
-                    torch_dtype=torch.bfloat16,
+                    torch_dtype=torch.float32,
                     max_position_embeddings=max_txt_len,
                     rope_scaling={
                         "type": "linear",
@@ -319,7 +319,7 @@ class VTGLLM(Blip2Base):
             else:
                 self.llama_model = LlamaForCausalLM.from_pretrained(
                     llama_model,
-                    torch_dtype=torch.bfloat16,
+                    torch_dtype=torch.float32,
                 )
 
         if use_grad_checkpoint:
@@ -488,10 +488,12 @@ class VTGLLM(Blip2Base):
         # x = einops.rearrange(x, 'b c t h w -> (b t) c h w')
         with self.maybe_autocast():
             # embed image features with blip2, out: (b t) q h
+            image = image.to(device=next(self.visual_encoder.parameters()).device, dtype=torch.float32)
             image_embeds = self.ln_vision(self.visual_encoder(image)).to(device)
-            # print(image_embeds.shape)
-            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device)
-
+            image_atts = torch.ones(
+                image_embeds.size()[:-1],
+                dtype=torch.long
+                ).to(image_embeds.device)
             query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
             if self.qformer_text_input:
                 # timestamps_input_ids = einops.rearrange(timestamp["input_ids"], 'b t d -> (b t) d')

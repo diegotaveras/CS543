@@ -307,6 +307,7 @@ class Chat:
             )
             video = self.vis_processor.transform(video)
             video = video.unsqueeze(0).to(self.device)
+            video = video.to(dtype=torch.float32)
             # print(image)
             raw_timestamps = msg.split('at')[1].replace('seconds.', '').strip().split(',')
             if self.model.qformer_text_input:

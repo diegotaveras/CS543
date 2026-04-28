@@ -82,19 +82,22 @@ args = parse_args()
 cfg = Config(args)
 
 DIR="your_dir_path"
-MODEL_DIR=f"ckpts/checkpoint_9.pth"
+MODEL_DIR=f"/Users/taver/Desktop/CS543/VTG-LLM/VTG-LLM/vtgllm.pth"
 
 model_config = cfg.model_cfg
 model_config.device_8bit = args.gpu_id
 model_config.ckpt = MODEL_DIR
 model_cls = registry.get_model_class(model_config.arch)
-model = model_cls.from_config(model_config).to('cuda:{}'.format(args.gpu_id))
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+model = model_cls.from_config(model_config).to(device)
+model = model.to(dtype=torch.float32, device=device)
+# model = model_cls.from_config(model_config).to('cuda:{}'.format(args.gpu_id))
 model.eval()
 
 vis_processor_cfg = cfg.datasets_cfg.webvid.vis_processor.train
 vis_processor = registry.get_processor_class(vis_processor_cfg.name).from_config(vis_processor_cfg)
 
-chat = Chat(model, vis_processor, device='cuda:{}'.format(args.gpu_id))
+chat = Chat(model, vis_processor, device=device)
 print('Initialization Finished')
 
 # ========================================
@@ -151,8 +154,6 @@ def fmt_output(msg):
 
 def gradio_answer(chatbot, chat_state, img_list, num_beams, temperature):
 
-    num_beams = args.num_beams
-    temperature = args.temperature
     llm_message = chat.answer(conv=chat_state,
                             img_list=img_list,
                             num_beams=num_beams,
