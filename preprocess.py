@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -8,6 +8,7 @@ import numpy as np
 
 PathLike = Union[str, Path]
 SsimThreshold = Union[float, str]
+FrameMetadata = Tuple[Sequence[float], Sequence[int]]
 
 
 def _save_frames(
@@ -75,13 +76,17 @@ def _resolve_ssim_threshold(
     percentile: float,
 ) -> float:
     if isinstance(threshold, str):
-        if threshold != "auto":
-            raise ValueError("ssim_threshold must be a number or 'auto'.")
-        if not 0 <= percentile <= 100:
-            raise ValueError("ssim_percentile must be between 0 and 100.")
-        if not similarities:
-            return 1.0
-        return float(np.percentile(np.array(similarities), percentile))
+        if threshold.lower() != "auto":
+            try:
+                threshold = float(threshold)
+            except ValueError as error:
+                raise ValueError("ssim_threshold must be a number or 'auto'.") from error
+        else:
+            if not 0 <= percentile <= 100:
+                raise ValueError("ssim_percentile must be between 0 and 100.")
+            if not similarities:
+                return 1.0
+            return float(np.percentile(np.array(similarities), percentile))
 
     threshold = float(threshold)
     if not -1.0 <= threshold <= 1.0:
@@ -93,6 +98,7 @@ def preprocess_video_uniform(
     video_path: PathLike,
     sample_every_seconds: float = 2.0,
     output_dir: Optional[PathLike] = None,
+    return_metadata: bool = False,
 ) -> np.ndarray:
     """Sample an MP4 video every `sample_every_seconds` seconds.
 
@@ -124,7 +130,10 @@ def preprocess_video_uniform(
         if output_dir is not None:
             _save_frames(frames, timestamps, output_dir, frame_indices)
 
-        return np.stack(frames, axis=0)
+        frame_array = np.stack(frames, axis=0)
+        if return_metadata:
+            return frame_array, (timestamps, frame_indices)
+        return frame_array
     finally:
         video.release()
 
@@ -135,6 +144,7 @@ def preprocess_video_ssim(
     ssim_frame_step: int = 20,
     ssim_percentile: float = 25.0,
     output_dir: Optional[PathLike] = None,
+    return_metadata: bool = False,
 ) -> np.ndarray:
     """Sample keyframes by comparing every Nth frame with SSIM."""
     if ssim_frame_step <= 0:
@@ -179,7 +189,10 @@ def preprocess_video_ssim(
         if output_dir is not None:
             _save_frames(frames, timestamps, output_dir, frame_indices)
 
-        return np.stack(frames, axis=0)
+        frame_array = np.stack(frames, axis=0)
+        if return_metadata:
+            return frame_array, (timestamps, frame_indices)
+        return frame_array
     finally:
         video.release()
 

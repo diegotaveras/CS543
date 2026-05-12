@@ -1,8 +1,12 @@
 import argparse
+import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+import requests
+import cv2
 import torch
 from PIL import Image
 
@@ -19,8 +23,130 @@ from llava.utils import disable_torch_init
 from preprocess import SsimThreshold, preprocess_video_ssim, preprocess_video_uniform
 
 
-DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "checkpoints/llava-fastvithd_7b_stage3"
-DEFAULT_PROMPT = "Describe the image in one sentence."
+DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "checkpoints/llava-fastvithd_0.5b_stage3"
+DEFAULT_PROMPT_PATH = Path(__file__).resolve().parent / "prompt.txt"
+DEFAULT_OPENROUTER_MODEL = "openai/gpt-oss-120b:free"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+@dataclass
+class FrameInput:
+    image: Image.Image
+    timestamp: Optional[float]
+
+
+@dataclass
+class FrameCaption:
+    frame_index: int
+    timestamp: Optional[float]
+    text: str
+
+
+@dataclass
+class IntervalCaptions:
+    start: FrameCaption
+    end: FrameCaption
+    additional: List[FrameCaption]
+
+
+def load_default_prompt() -> str:
+    if DEFAULT_PROMPT_PATH.exists():
+        prompt = DEFAULT_PROMPT_PATH.read_text(encoding="utf-8").strip()
+        if prompt:
+            return prompt
+    return "Describe the image in one sentence."
+
+
+DEFAULT_PROMPT = load_default_prompt()
+
+
+def load_openrouter_api_key() -> str:
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return os.environ["OPENROUTER_API_KEY"]
+
+    env_path = Path(__file__).resolve().parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            if key.strip() == "OPENROUTER_API_KEY":
+                return value.strip().strip("\"'")
+
+    raise RuntimeError("OPENROUTER_API_KEY was not found in the environment or ml-fastvlm/.env.")
+
+
+def build_event_summary_prompt(frame_outputs: List[str]) -> str:
+    observations = "\n\n".join(frame_outputs)
+    return (
+        "You are summarizing a video from chronological key-frame observations.\n"
+        "Each observation includes the timestamp of the source frame.\n"
+        "Merge repeated adjacent observations into continuous events when appropriate.\n"
+        "Use the frame timestamps to estimate when events happen.\n"
+        "You can reasonably infer actions that happen between different captions to better summarize.\n"
+        "Output:\n"
+        "1. A concise chronological event summary.\n"
+        f"Frame observations:\n{observations}"
+    )
+
+
+def build_enriched_event_summary_prompt(interval_outputs: List[str]) -> str:
+    observations = "\n\n".join(interval_outputs)
+    return (
+        "You are summarizing a video from chronological key-frame intervals.\n"
+        "Each interval is start-inclusive and end-exclusive.\n"
+        "Each interval includes the original key-frame caption at the start timestamp.\n"
+        "The end timestamp is only a boundary marker; its key-frame caption belongs to the next interval.\n"
+        "Some intervals also include Additional captions sampled uniformly inside the interval.\n"
+        "Use Additional captions to better understand what happens between keyframes.\n"
+        "In the final summary, preserve the original key-frame timestamp ranges for events.\n"
+        "Do not output separate events only for Additional captions unless they change the interval interpretation.\n"
+        "Merge repeated adjacent observations into continuous events when appropriate.\n"
+        "You can reasonably infer actions that happen between different captions to better summarize.\n"
+        "Output:\n"
+        "1. A concise chronological event summary using the original key-frame timestamp ranges.\n"
+        f"Key-frame intervals:\n{observations}"
+    )
+
+
+def summarize_events_with_openrouter(
+    frame_outputs: List[str],
+    model_name: str,
+    output_path: Path,
+    use_enriched_intervals: bool = False,
+) -> str:
+    api_key = load_openrouter_api_key()
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    build_enriched_event_summary_prompt(frame_outputs)
+                    if use_enriched_intervals
+                    else build_event_summary_prompt(frame_outputs)
+                ),
+            }
+        ],
+        "temperature": 0,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost",
+        "X-Title": "FastVLM Video Event Summary",
+    }
+
+    response = requests.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=120)
+    response.raise_for_status()
+    data = response.json()
+    summary = data["choices"][0]["message"]["content"].strip()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(summary + "\n", encoding="utf-8")
+    return summary
 
 
 def first_sentence(text: str) -> str:
@@ -53,6 +179,99 @@ def build_prompt(prompt: str, model_config, conv_mode: str) -> str:
     return conversation.get_prompt()
 
 
+def parse_timestamp_from_frame_path(path: Path) -> Optional[float]:
+    match = re.search(r"_([0-9]+(?:\.[0-9]+)?)s\.(?:png|jpe?g)$", path.name, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def format_timestamp(timestamp: Optional[float]) -> str:
+    if timestamp is None:
+        return "unknown"
+    return f"{timestamp:.2f}s"
+
+
+def read_video_frame_at_timestamp(video_path: Path, timestamp: float) -> FrameInput:
+    video = cv2.VideoCapture(str(video_path))
+    try:
+        if not video.isOpened():
+            raise ValueError(f"Unable to open video file: {video_path}")
+
+        fps = video.get(cv2.CAP_PROP_FPS)
+        frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        if fps <= 0 or frame_count <= 0:
+            raise ValueError(f"Unable to read FPS/frame count from video: {video_path}")
+
+        frame_index = min(max(int(round(timestamp * fps)), 0), frame_count - 1)
+        video.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        success, frame_bgr = video.read()
+        if not success:
+            raise ValueError(f"Unable to read frame at {timestamp:.2f}s from video: {video_path}")
+
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        return FrameInput(Image.fromarray(frame_rgb).convert("RGB"), frame_index / fps)
+    finally:
+        video.release()
+
+
+def sample_additional_interval_frames(
+    video_path: Path,
+    keyframes: List[FrameInput],
+    additional_captions: int,
+) -> List[List[FrameInput]]:
+    if additional_captions <= 0:
+        return [[] for _ in range(max(len(keyframes) - 1, 0))]
+
+    interval_frames = []
+    for start_frame, end_frame in zip(keyframes, keyframes[1:]):
+        if start_frame.timestamp is None or end_frame.timestamp is None:
+            raise ValueError("Additional captions require timestamped keyframes.")
+        if end_frame.timestamp <= start_frame.timestamp:
+            interval_frames.append([])
+            continue
+
+        step = (end_frame.timestamp - start_frame.timestamp) / (additional_captions + 1)
+        interval_frames.append(
+            [
+                read_video_frame_at_timestamp(video_path, start_frame.timestamp + step * index)
+                for index in range(1, additional_captions + 1)
+            ]
+        )
+
+    return interval_frames
+
+
+def format_frame_caption(caption: FrameCaption) -> str:
+    return f"frame {caption.frame_index:04d} timestamp={format_timestamp(caption.timestamp)}: {caption.text}"
+
+
+def format_interval_captions(interval_index: int, interval: IntervalCaptions) -> str:
+    lines = [
+        (
+            f"Key interval {interval_index:04d} "
+            f"[{format_timestamp(interval.start.timestamp)} - {format_timestamp(interval.end.timestamp)}]"
+        ),
+        f"Start key caption: {format_frame_caption(interval.start)}",
+    ]
+
+    if interval.additional:
+        lines.append("Additional captions:")
+        for caption in interval.additional:
+            lines.append(f"  timestamp={format_timestamp(caption.timestamp)}: {caption.text}")
+    else:
+        lines.append("Additional captions: none")
+
+    lines.append(
+        (
+            "End keyframe timestamp: "
+            f"{format_timestamp(interval.end.timestamp)} "
+            "(caption excluded; this keyframe starts the next interval)"
+        )
+    )
+    return "\n".join(lines)
+
+
 def load_frames_from_video(
     video_path: Path,
     sampling_mode: str,
@@ -61,33 +280,41 @@ def load_frames_from_video(
     ssim_frame_step: int,
     ssim_percentile: float,
     output_dir: Path,
-) -> List[Image.Image]:
+) -> List[FrameInput]:
     if sampling_mode == "uniform":
-        frame_array = preprocess_video_uniform(
+        frame_array, (timestamps, _) = preprocess_video_uniform(
             video_path,
             sample_every_seconds=sample_every_seconds,
             output_dir=output_dir,
+            return_metadata=True,
         )
     elif sampling_mode == "ssim":
-        frame_array = preprocess_video_ssim(
+        frame_array, (timestamps, _) = preprocess_video_ssim(
             video_path,
             ssim_threshold=ssim_threshold,
             ssim_frame_step=ssim_frame_step,
             ssim_percentile=ssim_percentile,
             output_dir=output_dir,
+            return_metadata=True,
         )
     else:
         raise ValueError(f"Unknown sampling mode: {sampling_mode}")
-    return [Image.fromarray(frame).convert("RGB") for frame in frame_array]
+    return [
+        FrameInput(Image.fromarray(frame).convert("RGB"), timestamp)
+        for frame, timestamp in zip(frame_array, timestamps)
+    ]
 
 
-def load_frames_from_dir(frames_dir: Path) -> List[Image.Image]:
+def load_frames_from_dir(frames_dir: Path) -> List[FrameInput]:
     image_paths = sorted(
         path for path in frames_dir.iterdir() if path.suffix.lower() in {".png", ".jpg", ".jpeg"}
     )
     if not image_paths:
         raise ValueError(f"No PNG/JPG frames found in: {frames_dir}")
-    return [Image.open(path).convert("RGB") for path in image_paths]
+    return [
+        FrameInput(Image.open(path).convert("RGB"), parse_timestamp_from_frame_path(path))
+        for path in image_paths
+    ]
 
 
 def sampling_output_dir(
@@ -118,7 +345,7 @@ def load_input_frames(
     ssim_frame_step: int,
     ssim_percentile: float,
     output_dir: Path,
-) -> List[Image.Image]:
+) -> List[FrameInput]:
     if input_path.is_dir():
         return load_frames_from_dir(input_path)
     if input_path.suffix.lower() == ".mp4":
@@ -135,7 +362,7 @@ def load_input_frames(
 
 
 def iter_inference(
-    frames: Iterable[Image.Image],
+    frames: Iterable[FrameInput],
     tokenizer,
     model,
     image_processor,
@@ -159,11 +386,15 @@ def iter_inference(
 
     model.generation_config.pad_token_id = tokenizer.pad_token_id
 
-    for frame_index, image in enumerate(frames):
+    for frame_index, frame in enumerate(frames):
         if limit_frames is not None and frame_index >= limit_frames:
             break
 
-        print(f"Running inference on frame {frame_index:04d}...", flush=True)
+        image = frame.image
+        print(
+            f"Running inference on frame {frame_index:04d} at {format_timestamp(frame.timestamp)}...",
+            flush=True,
+        )
         image_tensor = process_images([image], image_processor, model.config)[0]
         image_tensor = image_tensor.unsqueeze(0).half().to(torch.device(device))
 
@@ -183,7 +414,7 @@ def iter_inference(
         output = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
         if first_sentence_only:
             output = first_sentence(output)
-        yield frame_index, output
+        yield frame_index, frame.timestamp, output
 
 
 def main() -> None:
@@ -206,6 +437,19 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--limit-frames", type=int, default=None)
     parser.add_argument(
+        "--additionalCaptions",
+        type=int,
+        default=0,
+        help="Number of uniformly sampled additional captions inside each keyframe interval.",
+    )
+    parser.add_argument("--openrouter-model", type=str, default=DEFAULT_OPENROUTER_MODEL)
+    parser.add_argument("--summary-output", type=str, default=None)
+    parser.add_argument(
+        "--no-event-summary",
+        action="store_true",
+        help="Skip the OpenRouter event-summary step.",
+    )
+    parser.add_argument(
         "--raw-output",
         action="store_true",
         help="Print the full generated text instead of trimming to one sentence.",
@@ -223,12 +467,21 @@ def main() -> None:
         args.ssim_frame_step,
         args.ssim_percentile,
     )
+    summary_output = (
+        Path(args.summary_output).expanduser()
+        if args.summary_output
+        else frames_output_dir / "event_summary.txt"
+    )
     device = choose_device(args.device)
 
     if not model_path.exists():
         raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
     if args.limit_frames is not None and args.limit_frames <= 0:
         raise ValueError("--limit-frames must be greater than 0.")
+    if args.additionalCaptions < 0:
+        raise ValueError("--additionalCaptions must be greater than or equal to 0.")
+    if args.additionalCaptions > 0 and not input_path.is_file():
+        raise ValueError("--additionalCaptions requires an MP4 video input, not a frame folder.")
     if device == "cpu":
         print("Warning: running FastVLM on CPU will be very slow. Use --device mps or --device cuda when available.", flush=True)
 
@@ -256,8 +509,13 @@ def main() -> None:
         device=device,
     )
 
-    for frame_index, output in iter_inference(
-        frames,
+    keyframes = frames[:args.limit_frames] if args.limit_frames is not None else frames
+    if args.limit_frames is not None:
+        print(f"Using first {len(keyframes)} frame(s) after --limit-frames.", flush=True)
+
+    key_captions = []
+    for frame_index, timestamp, output in iter_inference(
+        keyframes,
         tokenizer,
         model,
         image_processor,
@@ -268,10 +526,87 @@ def main() -> None:
         args.top_p,
         args.num_beams,
         args.max_new_tokens,
-        args.limit_frames,
+        None,
         not args.raw_output,
     ):
-        print(f"frame {frame_index:04d}: {output}", flush=True)
+        caption = FrameCaption(frame_index, timestamp, output)
+        key_captions.append(caption)
+        frame_output = format_frame_caption(caption)
+        print(frame_output, flush=True)
+
+    summary_inputs = [format_frame_caption(caption) for caption in key_captions]
+    use_enriched_intervals = False
+
+    if args.additionalCaptions > 0 and len(keyframes) > 1:
+        print(
+            f"Sampling {args.additionalCaptions} additional caption frame(s) per keyframe interval...",
+            flush=True,
+        )
+        interval_frame_groups = sample_additional_interval_frames(
+            input_path,
+            keyframes,
+            args.additionalCaptions,
+        )
+
+        intervals = []
+        for interval_index, additional_frames in enumerate(interval_frame_groups):
+            additional_captions = []
+            for extra_index, timestamp, output in iter_inference(
+                additional_frames,
+                tokenizer,
+                model,
+                image_processor,
+                args.prompt,
+                args.conv_mode,
+                device,
+                args.temperature,
+                args.top_p,
+                args.num_beams,
+                args.max_new_tokens,
+                None,
+                not args.raw_output,
+            ):
+                caption = FrameCaption(extra_index, timestamp, output)
+                additional_captions.append(caption)
+                print(
+                    (
+                        f"interval {interval_index:04d} additional "
+                        f"{extra_index:04d} timestamp={format_timestamp(timestamp)}: {output}"
+                    ),
+                    flush=True,
+                )
+
+            intervals.append(
+                IntervalCaptions(
+                    start=key_captions[interval_index],
+                    end=key_captions[interval_index + 1],
+                    additional=additional_captions,
+                )
+            )
+
+        summary_inputs = [
+            format_interval_captions(interval_index, interval)
+            for interval_index, interval in enumerate(intervals)
+        ]
+        use_enriched_intervals = True
+    elif args.additionalCaptions > 0:
+        print("Skipping additional captions because fewer than 2 keyframes were generated.", flush=True)
+
+    if not args.no_event_summary:
+        if not summary_inputs:
+            print("Skipping event summary because no frame outputs were generated.", flush=True)
+            return
+
+        print(f"Summarizing events with OpenRouter model: {args.openrouter_model}", flush=True)
+        summary = summarize_events_with_openrouter(
+            summary_inputs,
+            args.openrouter_model,
+            summary_output,
+            use_enriched_intervals,
+        )
+        print("\nEvent summary:", flush=True)
+        print(summary, flush=True)
+        print(f"Saved event summary to: {summary_output.resolve()}", flush=True)
 
 
 if __name__ == "__main__":
