@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union
 
@@ -94,6 +95,38 @@ def _resolve_ssim_threshold(
     return threshold
 
 
+def _save_ssim_distribution_plot(
+    similarities: Sequence[float],
+    threshold: float,
+    percentile: float,
+    output_path: PathLike,
+) -> None:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(output.parent / ".matplotlib_cache"))
+
+    import matplotlib.pyplot as plt
+
+    fig, axis = plt.subplots(figsize=(8, 4.5))
+    axis.hist(similarities, bins=min(max(len(similarities), 1), 40), color="#4c78a8", alpha=0.82)
+    axis.axvline(
+        threshold,
+        color="#d62728",
+        linestyle="--",
+        linewidth=2,
+        label=f"cutoff = {threshold:.4f} (p{percentile:g})",
+    )
+    axis.set_title("SSIM Candidate Similarity Distribution")
+    axis.set_xlabel("SSIM between consecutive candidate frames")
+    axis.set_ylabel("Candidate frame pairs")
+    axis.set_xlim(-0.05, 1.05)
+    axis.grid(axis="y", alpha=0.25)
+    axis.legend()
+    fig.tight_layout()
+    fig.savefig(output, dpi=160)
+    plt.close(fig)
+
+
 def preprocess_video_uniform(
     video_path: PathLike,
     sample_every_seconds: float = 2.0,
@@ -144,6 +177,7 @@ def preprocess_video_ssim(
     ssim_frame_step: int = 20,
     ssim_percentile: float = 25.0,
     output_dir: Optional[PathLike] = None,
+    ssim_plot_path: Optional[PathLike] = None,
     return_metadata: bool = False,
 ) -> np.ndarray:
     """Sample keyframes by comparing every Nth frame with SSIM."""
@@ -177,6 +211,13 @@ def preprocess_video_ssim(
             consecutive_similarities,
             ssim_percentile,
         )
+        if ssim_plot_path is not None:
+            _save_ssim_distribution_plot(
+                consecutive_similarities,
+                resolved_threshold,
+                ssim_percentile,
+                ssim_plot_path,
+            )
 
         for frame_index, frame_rgb in candidates:
             similarity = _ssim(previous_kept_frame, frame_rgb)
@@ -253,6 +294,11 @@ def main() -> None:
         default="sampled_frames",
         help="Folder where sampled frames will be saved as PNGs.",
     )
+    parser.add_argument(
+        "--ssim-plot",
+        action="store_true",
+        help="Save a PNG plot of the SSIM distribution and selected threshold in SSIM mode.",
+    )
     args = parser.parse_args()
 
     if args.sampling_mode == "uniform":
@@ -275,6 +321,7 @@ def main() -> None:
             ssim_frame_step=args.ssim_frame_step,
             ssim_percentile=args.ssim_percentile,
             output_dir=output_dir,
+            ssim_plot_path=output_dir / "ssim_distribution.png" if args.ssim_plot else None,
         )
     print(f"frames shape: {frames.shape}")
     print(f"frames dtype: {frames.dtype}")
