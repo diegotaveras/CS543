@@ -100,6 +100,7 @@ def build_event_summary_prompt(frame_outputs: List[str]) -> str:
         "You can reasonably infer actions that happen between different captions to better summarize.\n"
         "Output:\n"
         "1. A concise chronological event summary.\n"
+        "2. Your event rows should be output in this exact format: [start_time, end_time]: <summary>\n"
         f"Frame observations:\n{observations}"
     )
 
@@ -119,6 +120,7 @@ def build_enriched_event_summary_prompt(interval_outputs: List[str]) -> str:
         "You can reasonably infer actions that happen between different captions to better summarize.\n"
         "Output:\n"
         "1. A concise chronological event summary using the original key-frame timestamp ranges.\n"
+        "2. Your event rows should be output in this exact format: [start_time, end_time]: <summary>\n"
         f"Key-frame intervals:\n{observations}"
     )
 
