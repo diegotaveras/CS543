@@ -59,6 +59,13 @@ class IntervalCaptions:
     additional: List[FrameCaption]
 
 
+@dataclass
+class LoadedModel:
+    tokenizer: object
+    model: object
+    image_processor: object
+
+
 def load_default_prompt() -> str:
     for prompt_path in (DEFAULT_PROMPT_PATH, FALLBACK_PROMPT_PATH):
         if prompt_path.exists():
@@ -179,6 +186,18 @@ def choose_device(requested_device: str) -> str:
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
+
+
+def load_fastvlm_checkpoint(model_path: Path, model_base: Optional[str], device: str, label: str) -> LoadedModel:
+    model_name = get_model_name_from_path(str(model_path))
+    print(f"Loading {label} model from: {model_path}", flush=True)
+    tokenizer, model, image_processor, _ = load_pretrained_model(
+        str(model_path),
+        model_base,
+        model_name,
+        device=device,
+    )
+    return LoadedModel(tokenizer=tokenizer, model=model, image_processor=image_processor)
 
 
 def build_prompt(prompt: str, model_config, conv_mode: str) -> str:
@@ -316,6 +335,8 @@ def build_chunk_worker_command(args, chunk_index: int, chunk_count: int, chunk_o
         str(chunk_output),
     ]
     add_optional_arg(command, "--model-base", args.model_base)
+    add_optional_arg(command, "--key_frame_model", args.key_frame_model)
+    add_optional_arg(command, "--uniform_frame_model", args.uniform_frame_model)
     add_optional_arg(command, "--top-p", args.top_p)
     add_optional_arg(command, "--limit-frames", args.limit_frames)
     if args.raw_output:
@@ -332,6 +353,28 @@ def run_video_chunk_workers(args) -> None:
 
     chunk_output_dir = Path(args.chunk_output_dir).expanduser()
     chunk_output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.ssim_plot:
+        if args.sampling_mode != "ssim":
+            print("Skipping SSIM distribution plot because --sampling-mode is not ssim.", flush=True)
+        else:
+            plot_dir = sampling_output_dir(
+                Path(args.frames_output_dir).expanduser(),
+                args.sampling_mode,
+                args.sample_every_seconds,
+                args.ssim_threshold,
+                args.ssim_frame_step,
+                args.ssim_percentile,
+            )
+            plot_path = plot_dir / "ssim_distribution.png"
+            preprocess_video_ssim(
+                input_path,
+                ssim_threshold=args.ssim_threshold,
+                ssim_frame_step=args.ssim_frame_step,
+                ssim_percentile=args.ssim_percentile,
+                ssim_plot_path=plot_path,
+            )
+            print(f"Saved SSIM distribution plot to: {plot_path.resolve()}", flush=True)
 
     print(f"Starting {args.videoChunks} chunk worker process(es)...", flush=True)
     processes = []
@@ -477,6 +520,7 @@ def load_frames_from_video(
     ssim_frame_step: int,
     ssim_percentile: float,
     output_dir: Optional[Path],
+    ssim_plot_path: Optional[Path],
 ) -> List[FrameInput]:
     if sampling_mode == "uniform":
         frame_array, (timestamps, _) = preprocess_video_uniform(
@@ -492,6 +536,7 @@ def load_frames_from_video(
             ssim_frame_step=ssim_frame_step,
             ssim_percentile=ssim_percentile,
             output_dir=output_dir,
+            ssim_plot_path=ssim_plot_path,
             return_metadata=True,
         )
     else:
@@ -542,6 +587,7 @@ def load_input_frames(
     ssim_frame_step: int,
     ssim_percentile: float,
     output_dir: Optional[Path],
+    ssim_plot_path: Optional[Path],
 ) -> List[FrameInput]:
     if input_path.is_dir():
         return load_frames_from_dir(input_path)
@@ -554,6 +600,7 @@ def load_input_frames(
             ssim_frame_step,
             ssim_percentile,
             output_dir,
+            ssim_plot_path,
         )
     raise ValueError("Input must be an .mp4 video file or a folder of sampled PNG/JPG frames.")
 
@@ -618,6 +665,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run FastVLM inference on sampled video frames.")
     parser.add_argument("input_path", type=str, help="Path to an MP4 video or folder of sampled frames.")
     parser.add_argument("--model-path", type=str, default=str(DEFAULT_MODEL_PATH))
+    parser.add_argument(
+        "--key_frame_model",
+        type=str,
+        default=None,
+        help="Optional checkpoint path used only for keyframe captions. Requires --uniform_frame_model.",
+    )
+    parser.add_argument(
+        "--uniform_frame_model",
+        type=str,
+        default=None,
+        help="Optional checkpoint path used only for additional uniform interval captions. Requires --key_frame_model.",
+    )
     parser.add_argument("--model-base", type=str, default=None)
     parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
     parser.add_argument("--conv-mode", type=str, default="qwen_2")
@@ -626,6 +685,11 @@ def main() -> None:
     parser.add_argument("--ssim-threshold", default="0.90")
     parser.add_argument("--ssim-frame-step", type=int, default=20)
     parser.add_argument("--ssim-percentile", type=float, default=25.0)
+    parser.add_argument(
+        "--ssim-plot",
+        action="store_true",
+        help="Save a PNG plot of the SSIM distribution and selected threshold in SSIM mode.",
+    )
     parser.add_argument("--frames-output-dir", type=str, default="sampled_frames")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "mps", "cuda", "cpu"])
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -674,6 +738,9 @@ def main() -> None:
 
     input_path = Path(args.input_path).expanduser()
     model_path = Path(args.model_path).expanduser()
+    key_frame_model_path = Path(args.key_frame_model).expanduser() if args.key_frame_model else None
+    uniform_frame_model_path = Path(args.uniform_frame_model).expanduser() if args.uniform_frame_model else None
+    split_model_mode = key_frame_model_path is not None or uniform_frame_model_path is not None
     frames_output_root = Path(args.frames_output_dir).expanduser()
     frames_output_dir = sampling_output_dir(
         frames_output_root,
@@ -690,7 +757,14 @@ def main() -> None:
     )
     device = choose_device(args.device)
 
-    if not model_path.exists():
+    if split_model_mode and (key_frame_model_path is None or uniform_frame_model_path is None):
+        raise ValueError("--key_frame_model and --uniform_frame_model must be provided together.")
+    if split_model_mode:
+        if not key_frame_model_path.exists():
+            raise FileNotFoundError(f"Keyframe model checkpoint not found: {key_frame_model_path}")
+        if not uniform_frame_model_path.exists():
+            raise FileNotFoundError(f"Uniform-frame model checkpoint not found: {uniform_frame_model_path}")
+    elif not model_path.exists():
         raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
     if args.limit_frames is not None and args.limit_frames <= 0:
         raise ValueError("--limit-frames must be greater than 0.")
@@ -721,7 +795,12 @@ def main() -> None:
         args.ssim_frame_step,
         args.ssim_percentile,
         preprocessing_output_dir,
+        frames_output_dir / "ssim_distribution.png" if args.ssim_plot and args.sampling_mode == "ssim" else None,
     )
+    if args.ssim_plot and args.sampling_mode != "ssim":
+        print("Skipping SSIM distribution plot because --sampling-mode is not ssim.", flush=True)
+    elif args.ssim_plot and not is_chunk_worker:
+        print(f"Saved SSIM distribution plot to: {(frames_output_dir / 'ssim_distribution.png').resolve()}", flush=True)
     if is_chunk_worker:
         duration = get_video_duration(input_path)
         start_time, end_time = chunk_time_bounds(duration, args.chunk_index, args.chunk_count)
@@ -745,14 +824,20 @@ def main() -> None:
         return
 
     disable_torch_init()
-    model_name = get_model_name_from_path(str(model_path))
-    print(f"Loading model from: {model_path}", flush=True)
-    tokenizer, model, image_processor, _ = load_pretrained_model(
-        str(model_path),
-        args.model_base,
-        model_name,
-        device=device,
-    )
+    if split_model_mode:
+        keyframe_model = load_fastvlm_checkpoint(key_frame_model_path, args.model_base, device, "keyframe")
+        if uniform_frame_model_path == key_frame_model_path:
+            uniform_model = keyframe_model
+        else:
+            uniform_model = load_fastvlm_checkpoint(
+                uniform_frame_model_path,
+                args.model_base,
+                device,
+                "uniform interval",
+            )
+    else:
+        keyframe_model = load_fastvlm_checkpoint(model_path, args.model_base, device, "FastVLM")
+        uniform_model = keyframe_model
 
     keyframes = frames[:args.limit_frames] if args.limit_frames is not None else frames
     if args.limit_frames is not None:
@@ -761,9 +846,9 @@ def main() -> None:
     key_captions = []
     for frame_index, timestamp, output in iter_inference(
         keyframes,
-        tokenizer,
-        model,
-        image_processor,
+        keyframe_model.tokenizer,
+        keyframe_model.model,
+        keyframe_model.image_processor,
         args.prompt,
         args.conv_mode,
         device,
@@ -798,9 +883,9 @@ def main() -> None:
             additional_captions = []
             for extra_index, timestamp, output in iter_inference(
                 additional_frames,
-                tokenizer,
-                model,
-                image_processor,
+                uniform_model.tokenizer,
+                uniform_model.model,
+                uniform_model.image_processor,
                 args.prompt,
                 args.conv_mode,
                 device,
